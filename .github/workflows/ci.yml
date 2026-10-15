@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  IMAGE: hello-fastapi:ci
+
+jobs:
+  docker:
+    name: Docker build & smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t "$IMAGE" .
+
+      - name: Run container and check response
+        run: |
+          docker run -d --name app -p 32777:32777 "$IMAGE"
+          for i in $(seq 1 20); do curl -fsS localhost:32777/ && break; sleep 1; done
+          curl -fsS localhost:32777/ | grep -q '"message":"Hello World"'
+
+  kubernetes:
+    name: Deploy to kind cluster
+    runs-on: ubuntu-latest
+    needs: docker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate manifests
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          ./kubeconform -strict -summary k8s-manifests.yaml
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+
+      - name: Build image and load into cluster
+        run: |
+          docker build -t "$IMAGE" .
+          kind load docker-image "$IMAGE" --name chart-testing
+
+      - name: Deploy
+        run: |
+          kubectl apply -f k8s-manifests.yaml
+          kubectl set image deployment/hello-world-deployment fastapi-app="$IMAGE"
+          kubectl rollout status deployment/hello-world-deployment --timeout=120s
+          kubectl get pods -l app=hello-world -o wide
+
+      - name: Check load balancing between pods
+        run: |
+          # запросы идут изнутри кластера через Service, как от другого приложения
+          kubectl run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- \
+            sh -c 'for i in $(seq 1 30); do curl -s http://hello-world-service/; echo; done'
+          kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/curl --timeout=90s
+          PODS=$(kubectl logs curl | grep -o '"handled_by_pod":"[^"]*"' | sort -u | wc -l)
+          echo "Ответили разных подов: $PODS"
+          test "$PODS" -eq 2
+
+      - name: Debug on failure
+        if: failure()
+        run: |
+          kubectl get all
+          kubectl describe pods -l app=hello-world
+          kubectl logs -l app=hello-world --tail=50
